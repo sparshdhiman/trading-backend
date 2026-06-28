@@ -11,7 +11,7 @@ app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-const FINNHUB_KEY = process.env.FINNHUB_KEY || ""; // set in fly secrets
+const FINNHUB_KEY = process.env.FINNHUB_KEY || "d90bf29r01qk8bfk79lgd90bf29r01qk8bfk79m0"; // set in fly secrets
 
 // ── CACHE ─────────────────────────────────────────────────────────
 const state = {
