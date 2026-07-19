@@ -389,16 +389,15 @@ async function fetch13FHoldings(cik, accessionNumber) {
       holdingsMap[name].value += value;
     });
 
-    const holdings = Object.values(holdingsMap)
-      .sort((a, b) => b.value - a.value)
-      .slice(0, 6)
-      .map(h => ({
-        name: h.name,
-        value: fmtUsdShort(h.value),
-        pct: totalValue > 0 ? +((h.value / totalValue) * 100).toFixed(1) : 0,
-      }));
+    const allHoldings = Object.values(holdingsMap).sort((a, b) => b.value - a.value);
 
-    return { holdings, totalValue, totalValueFmt: fmtUsdShort(totalValue), positionCount: Object.keys(holdingsMap).length };
+    const holdings = allHoldings.slice(0, 6).map(h => ({
+      name: h.name,
+      value: fmtUsdShort(h.value),
+      pct: totalValue > 0 ? +((h.value / totalValue) * 100).toFixed(1) : 0,
+    }));
+
+    return { holdings, allHoldings, totalValue, totalValueFmt: fmtUsdShort(totalValue), positionCount: Object.keys(holdingsMap).length };
   } catch (e) {
     console.error("[13F parse] error:", e.message);
     return null;
@@ -417,35 +416,77 @@ async function fetchInstitution(inst) {
     const dates = d.filings?.recent?.filingDate || [];
     const accNums = d.filings?.recent?.accessionNumber || [];
 
-    let filingDate = null, accessionNumber = null;
+    // Find latest and prior 13F-HR filings
+    const filings13F = [];
     for (let i = 0; i < forms.length; i++) {
-      if (forms[i] === "13F-HR") {
-        filingDate = dates[i];
-        accessionNumber = accNums[i];
-        break;
-      }
+      if (forms[i] === "13F-HR") filings13F.push({ date: dates[i], accNum: accNums[i] });
+      if (filings13F.length >= 2) break;
     }
 
-    if (!accessionNumber) {
-      return { name: inst.name, manager: inst.manager, cik: inst.cik, filingDate: null, holdings: [], positionCount: 0, totalValueFmt: "—", error: "No 13F found" };
+    if (filings13F.length === 0) {
+      return { name: inst.name, manager: inst.manager, cik: inst.cik, filingDate: null, holdings: [], positionCount: 0, totalValueFmt: "—", deltas: [], error: "No 13F found" };
     }
 
-    const parsed = await fetch13FHoldings(inst.cik, accessionNumber);
+    const [latest, prior] = filings13F;
+    const parsedLatest = await fetch13FHoldings(inst.cik, latest.accNum);
+    const parsedPrior = prior ? await fetch13FHoldings(inst.cik, prior.accNum) : null;
+
+    const deltas = computeDeltas(parsedLatest?.allHoldings, parsedPrior?.allHoldings);
 
     return {
       name: inst.name,
       manager: inst.manager,
       cik: inst.cik,
-      filingDate,
+      filingDate: latest.date,
       secUrl: `https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=${inst.cik}&type=13F`,
-      positionCount: parsed?.positionCount || 0,
-      totalValueFmt: parsed?.totalValueFmt || "—",
-      holdings: parsed?.holdings || [],
+      positionCount: parsedLatest?.positionCount || 0,
+      totalValueFmt: parsedLatest?.totalValueFmt || "—",
+      holdings: parsedLatest?.holdings || [],
+      deltas,
     };
   } catch (e) {
     console.error(`[13F] ${inst.name}: ${e.message}`);
-    return { name: inst.name, manager: inst.manager, cik: inst.cik, filingDate: null, holdings: [], positionCount: 0, totalValueFmt: "—", error: e.message };
+    return { name: inst.name, manager: inst.manager, cik: inst.cik, filingDate: null, holdings: [], positionCount: 0, totalValueFmt: "—", deltas: [], error: e.message };
   }
+}
+
+// Compare two quarters of holdings and generate ADD/EXIT/NEW/TRIM tags
+function computeDeltas(latest, prior) {
+  if (!latest || !prior) return [];
+
+  const latestMap = new Map(latest.map(h => [h.name, h.value]));
+  const priorMap = new Map(prior.map(h => [h.name, h.value]));
+
+  const tags = [];
+
+  // New positions (in latest, not in prior) - sorted by value, top 2
+  const newPos = latest.filter(h => !priorMap.has(h.name)).sort((a,b) => b.value - a.value).slice(0, 2);
+  newPos.forEach(h => tags.push(`NEW ${shortName(h.name)}`));
+
+  // Exited positions (in prior, not in latest) - sorted by value, top 2
+  const exited = prior.filter(h => !latestMap.has(h.name)).sort((a,b) => b.value - a.value).slice(0, 2);
+  exited.forEach(h => tags.push(`EXIT ${shortName(h.name)}`));
+
+  // Added (increased by >20%) - top 1
+  const added = latest.filter(h => {
+    const p = priorMap.get(h.name);
+    return p && h.value > p * 1.2;
+  }).sort((a,b) => (b.value - priorMap.get(b.name)) - (a.value - priorMap.get(a.name))).slice(0, 1);
+  added.forEach(h => tags.push(`ADD ${shortName(h.name)}`));
+
+  // Trimmed (decreased by >20%) - top 1
+  const trimmed = latest.filter(h => {
+    const p = priorMap.get(h.name);
+    return p && h.value < p * 0.8;
+  }).sort((a,b) => (priorMap.get(a.name) - a.value) - (priorMap.get(b.name) - b.value)).slice(0, 1);
+  trimmed.forEach(h => tags.push(`TRIM ${shortName(h.name)}`));
+
+  return tags.slice(0, 5);
+}
+
+function shortName(name) {
+  // Simplify company names for tags: "APPLE INC" -> "APPLE"
+  return name.replace(/\s+(INC|CORP|CORPORATION|CO|LTD|TR|ETF)\.?$/i, "").split(" ").slice(0,2).join(" ");
 }
 
 async function refreshInstitutions() {
